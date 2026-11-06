@@ -47,6 +47,7 @@ namespace EventLog
         CheckBox failureBox;
         CheckBox signOutBox;
         CheckBox serviceBox;
+        CheckBox establishedBox;
         Label rdpCount;
         Label sshCount;
         Label failureCount;
@@ -167,7 +168,7 @@ namespace EventLog
             bannerHost.Controls.Add(elevateButton);
             banner.Controls.Add(bannerHost);
 
-            var filters = StackedSection(112, Color.White, out var filterBody);
+            var filters = Collapsible("Logs", 124, true, out var filterBody);
             filterBody.Padding = new Padding(16, 10, 16, 8);
             var row = new TableLayoutPanel
             {
@@ -227,9 +228,9 @@ namespace EventLog
             var checks = new FlowLayoutPanel
             {
                 Dock = DockStyle.Top,
-                Height = 36,
+                Height = 64,
                 FlowDirection = FlowDirection.LeftToRight,
-                WrapContents = false,
+                WrapContents = true,
                 Padding = new Padding(0, 6, 0, 0)
             };
             rdpBox = Check("RDP", true);
@@ -259,7 +260,9 @@ namespace EventLog
             tips.SetToolTip(signOutBox, "User sign-out, Remote Desktop disconnect, and reconnect from the Security log.");
             tips.SetToolTip(serviceBox, "Include service, batch, and machine-account sign-ins.");
 
-            var cards = new Panel { Dock = DockStyle.Top, Height = 84, BackColor = Page, Padding = new Padding(10, 8, 10, 8) };
+            var cards = Collapsible("Summary", 76, true, out var cardBody);
+            cardBody.BackColor = Page;
+            cardBody.Padding = new Padding(10, 8, 10, 8);
             var cardTable = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 4, RowCount = 1, BackColor = Page };
             for (int i = 0; i < 4; i++)
                 cardTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25));
@@ -268,9 +271,9 @@ namespace EventLog
             cardTable.Controls.Add(MakeCard("SSH events", Color.FromArgb(30, 90, 150), out sshCount), 1, 0);
             cardTable.Controls.Add(MakeCard("Failed attempts", FailFg, out failureCount), 2, 0);
             cardTable.Controls.Add(MakeCard("Source addresses", Navy, out addressCount), 3, 0);
-            cards.Controls.Add(cardTable);
+            cardBody.Controls.Add(cardTable);
 
-            var addressSection = StackedSection(156, Color.White, out var addressBody);
+            var addressSection = Collapsible("Addresses", 150, true, out var addressBody);
             addressBody.Padding = new Padding(12, 8, 12, 8);
             var addressTable = new TableLayoutPanel
             {
@@ -286,7 +289,7 @@ namespace EventLog
             addressTable.Controls.Add(AddressColumn("Succeeded", Teal, succeededList, out succeededCaption), 0, 0);
             addressTable.Controls.Add(AddressColumn("Failed", FailFg, failedList, out failedCaption), 1, 0);
             addressBody.Controls.Add(addressTable);
-            tips.SetToolTip(succeededList, "Inbound connections and successful sign-ins. Click an address to filter the grid.");
+            tips.SetToolTip(succeededList, "Remote addresses that reached this computer, including sign-in, reconnect, and disconnect. Click an address to filter the grid.");
             tips.SetToolTip(failedList, "Failed sign-ins. Click an address to filter the grid.");
 
             var quick = StackedSection(48, Color.White, out var quickBody);
@@ -315,6 +318,9 @@ namespace EventLog
             directionBox.Items.Add("Out");
             directionBox.Items.Add("Local");
             directionBox.SelectedIndex = 0;
+            establishedBox = Check("Established", false);
+            establishedBox.Dock = DockStyle.Left;
+            establishedBox.Padding = new Padding(18, 3, 0, 0);
             var directionLabel = FieldLabel("Direction");
             directionLabel.AutoSize = false;
             directionLabel.Dock = DockStyle.Left;
@@ -322,12 +328,15 @@ namespace EventLog
             directionLabel.TextAlign = ContentAlignment.MiddleLeft;
             directionLabel.Padding = new Padding(16, 0, 0, 0);
             quickBody.Controls.Add(showingLabel);
+            quickBody.Controls.Add(establishedBox);
             quickBody.Controls.Add(directionBox);
             quickBody.Controls.Add(directionLabel);
             quickBody.Controls.Add(filterBox);
             quickBody.Controls.Add(filterLabel);
             filterBox.TextChanged += (sender, args) => ApplyFilter();
             directionBox.SelectedIndexChanged += (sender, args) => ApplyFilter();
+            establishedBox.CheckedChanged += (sender, args) => ApplyFilter();
+            tips.SetToolTip(establishedBox, "Completed sessions only: successful sign-ins, reconnects, and disconnects. Hides connections that reached the server but never signed in.");
             tips.SetToolTip(directionBox, "In: someone reached this computer. Out: this computer opened Remote Desktop to another server. Local: a sign-in on this computer.");
 
             var split = new SplitContainer
@@ -341,7 +350,11 @@ namespace EventLog
             var gridFrame = new Panel { Dock = DockStyle.Fill, BackColor = Line, Padding = new Padding(1, 1, 1, 0) };
             grid = new DataGridView { Dock = DockStyle.Fill };
             ConfigureGrid();
+            var detailToggle = SectionButton("▾   Hide event");
+            detailToggle.Dock = DockStyle.Bottom;
+            detailToggle.Click += (sender, args) => ToggleEventDetail(split, detailToggle);
             gridFrame.Controls.Add(grid);
+            gridFrame.Controls.Add(detailToggle);
             split.Panel1.Controls.Add(gridFrame);
 
             var detailFrame = new Panel { Dock = DockStyle.Fill, BackColor = Line, Padding = new Padding(1, 0, 1, 1) };
@@ -687,6 +700,12 @@ namespace EventLog
                     filter += " AND ";
                 filter += "Direction = '" + direction + "'";
             }
+            if (establishedBox.Checked)
+            {
+                if (filter.Length > 0)
+                    filter += " AND ";
+                filter += "(Result = 'Success' OR Result = 'Reconnect' OR Result = 'Disconnect' OR Result = 'Logoff' OR Result = 'Info')";
+            }
             try
             {
                 view.RowFilter = filter;
@@ -727,7 +746,7 @@ namespace EventLog
                     addresses.Add(host);
                     if (result == "Failure")
                         AddCount(failedAddresses, host);
-                    else if (direction == "In" && (result == "Success" || result == "Connect"))
+                    else if (direction == "In")
                         AddCount(succeeded, host);
                 }
             }
@@ -943,6 +962,86 @@ namespace EventLog
             failureBox.Enabled = !value;
             signOutBox.Enabled = !value;
             serviceBox.Enabled = !value;
+        }
+
+        Panel Collapsible(string title, int bodyHeight, bool open, out Panel body)
+        {
+            const int headerHeight = 32;
+            var expanded = open;
+            var outer = new Panel
+            {
+                Dock = DockStyle.Top,
+                Height = open ? headerHeight + bodyHeight : headerHeight,
+                BackColor = Line,
+                Padding = new Padding(0, 0, 0, 1)
+            };
+            body = new Panel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = Color.White,
+                Visible = open
+            };
+            var header = SectionButton((open ? "▾   " : "▸   ") + title);
+            var sectionBody = body;
+            var sectionOuter = outer;
+            header.Click += (sender, args) =>
+            {
+                expanded = !expanded;
+                sectionBody.Visible = expanded;
+                sectionOuter.Height = expanded ? headerHeight + bodyHeight : headerHeight;
+                header.Text = (expanded ? "▾   " : "▸   ") + title;
+            };
+            outer.Controls.Add(sectionBody);
+            outer.Controls.Add(header);
+            return outer;
+        }
+
+        Button SectionButton(string text)
+        {
+            var button = new Button
+            {
+                Text = text,
+                Dock = DockStyle.Top,
+                Height = 32,
+                FlatStyle = FlatStyle.Flat,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Font = boldFont,
+                ForeColor = Ink,
+                BackColor = Color.FromArgb(236, 240, 244),
+                Cursor = Cursors.Hand,
+                UseVisualStyleBackColor = false
+            };
+            button.FlatAppearance.BorderSize = 0;
+            button.FlatAppearance.MouseOverBackColor = Color.FromArgb(226, 232, 238);
+            button.FlatAppearance.MouseDownBackColor = Color.FromArgb(214, 222, 230);
+            return button;
+        }
+
+        void ToggleEventDetail(SplitContainer split, Button toggle)
+        {
+            bool hide = !split.Panel2Collapsed;
+            try
+            {
+                if (hide)
+                {
+                    split.Panel1MinSize = 25;
+                    split.Panel2MinSize = 25;
+                    split.Panel2Collapsed = true;
+                }
+                else
+                {
+                    split.Panel2Collapsed = false;
+                    split.Panel1MinSize = 120;
+                    split.Panel2MinSize = 90;
+                    int room = split.Height - split.Panel2MinSize - split.SplitterWidth;
+                    if (room > split.Panel1MinSize)
+                        split.SplitterDistance = Math.Max(split.Panel1MinSize, split.Height - 190);
+                }
+            }
+            catch (InvalidOperationException)
+            {
+            }
+            toggle.Text = split.Panel2Collapsed ? "▸   Show event" : "▾   Hide event";
         }
 
         static Panel StackedSection(int height, Color back, out Panel body)
