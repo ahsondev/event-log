@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.Data;
 using System.Diagnostics;
@@ -50,6 +51,11 @@ namespace EventLog
         Label sshCount;
         Label failureCount;
         Label addressCount;
+        Label succeededCaption;
+        Label failedCaption;
+        ListView succeededList;
+        ListView failedList;
+        bool fillingAddresses;
         TextBox filterBox;
         ComboBox directionBox;
         Label showingLabel;
@@ -248,7 +254,7 @@ namespace EventLog
             tips.SetToolTip(rdpBox, "Inbound Remote Desktop, local sessions in that log, and outbound connections from this computer.");
             tips.SetToolTip(sshBox, "OpenSSH event log, sshd.log, and Windows sign-ins from sshd.");
             tips.SetToolTip(consoleBox, "Local sign-in, unlock, and runas.");
-            tips.SetToolTip(networkBox, "File share, WinRM, and other network sign-ins. This can be noisy.");
+            tips.SetToolTip(networkBox, "Network sign-ins, SMB, and file-share access. File-share auditing can be noisy.");
             tips.SetToolTip(failureBox, "Every failed Windows sign-in, of any type.");
             tips.SetToolTip(signOutBox, "User sign-out, Remote Desktop disconnect, and reconnect from the Security log.");
             tips.SetToolTip(serviceBox, "Include service, batch, and machine-account sign-ins.");
@@ -263,6 +269,25 @@ namespace EventLog
             cardTable.Controls.Add(MakeCard("Failed attempts", FailFg, out failureCount), 2, 0);
             cardTable.Controls.Add(MakeCard("Source addresses", Navy, out addressCount), 3, 0);
             cards.Controls.Add(cardTable);
+
+            var addressSection = StackedSection(156, Color.White, out var addressBody);
+            addressBody.Padding = new Padding(12, 8, 12, 8);
+            var addressTable = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 2,
+                RowCount = 1
+            };
+            addressTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+            addressTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+            addressTable.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            succeededList = MakeAddressList();
+            failedList = MakeAddressList();
+            addressTable.Controls.Add(AddressColumn("Succeeded", Teal, succeededList, out succeededCaption), 0, 0);
+            addressTable.Controls.Add(AddressColumn("Failed", FailFg, failedList, out failedCaption), 1, 0);
+            addressBody.Controls.Add(addressTable);
+            tips.SetToolTip(succeededList, "Inbound connections and successful sign-ins. Click an address to filter the grid.");
+            tips.SetToolTip(failedList, "Failed sign-ins. Click an address to filter the grid.");
 
             var quick = StackedSection(48, Color.White, out var quickBody);
             quickBody.Padding = new Padding(16, 8, 16, 8);
@@ -379,6 +404,7 @@ namespace EventLog
             Controls.Add(split);
             Controls.Add(status);
             Controls.Add(quick);
+            Controls.Add(addressSection);
             Controls.Add(cards);
             Controls.Add(filters);
             Controls.Add(banner);
@@ -441,6 +467,12 @@ namespace EventLog
             AddColumn("Result", "Result", 10, 80, null);
             AddColumn("User", "Account", 16, 120, null);
             AddColumn("Address", "Address", 14, 120, null);
+            var portColumn = AddColumn("Port", "Port", 8, 64, null);
+            portColumn.DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleRight;
+            portColumn.HeaderCell.Style.Alignment = DataGridViewContentAlignment.MiddleRight;
+            portColumn.HeaderCell.ToolTipText = "Source port of the remote computer. Blank when Windows did not record one.";
+            var actionColumn = AddColumn("Action", "Action", 18, 150, null);
+            actionColumn.HeaderCell.ToolTipText = "What the attempt was doing, such as an NTLM or SMB sign-in, a file share, Remote Desktop, or SSH.";
             AddColumn("LogonType", "Logon type", 14, 110, null);
             var eventColumn = AddColumn("EventId", "Event", 8, 70, null);
             eventColumn.DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleRight;
@@ -584,6 +616,8 @@ namespace EventLog
             table.Columns.Add("Result", typeof(string));
             table.Columns.Add("User", typeof(string));
             table.Columns.Add("Address", typeof(string));
+            table.Columns.Add("Port", typeof(string));
+            table.Columns.Add("Action", typeof(string));
             table.Columns.Add("LogonType", typeof(string));
             table.Columns.Add("EventId", typeof(int));
             table.Columns.Add("Channel", typeof(string));
@@ -599,6 +633,8 @@ namespace EventLog
                     ev.Result ?? "",
                     ev.User ?? "",
                     ev.Address ?? "",
+                    ev.Port ?? "",
+                    ev.Action ?? "",
                     ev.LogonType ?? "",
                     ev.EventId,
                     ev.Channel ?? "",
@@ -636,6 +672,8 @@ namespace EventLog
                     " OR Result LIKE '%" + escaped + "%'" +
                     " OR User LIKE '%" + escaped + "%'" +
                     " OR Address LIKE '%" + escaped + "%'" +
+                    " OR Port LIKE '%" + escaped + "%'" +
+                    " OR Action LIKE '%" + escaped + "%'" +
                     " OR LogonType LIKE '%" + escaped + "%'" +
                     " OR Channel LIKE '%" + escaped + "%'" +
                     " OR Summary LIKE '%" + escaped + "%'" +
@@ -670,21 +708,31 @@ namespace EventLog
             int rdp = 0;
             int ssh = 0;
             int failed = 0;
-            var addresses = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var addresses = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var succeeded = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            var failedAddresses = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
             if (view != null)
             {
                 foreach (DataRowView row in view)
                 {
                     var source = Convert.ToString(row["Source"]);
                     var result = Convert.ToString(row["Result"]);
+                    var direction = Convert.ToString(row["Direction"]);
                     if (source == "RDP") rdp++;
                     else if (source == "SSH") ssh++;
                     if (result == "Failure") failed++;
                     var host = HostOnly(Convert.ToString(row["Address"]));
-                    if (host.Length > 0 && !host.Equals("local", StringComparison.OrdinalIgnoreCase))
-                        addresses.Add(host);
+                    if (host.Length == 0 || host.Equals("local", StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    addresses.Add(host);
+                    if (result == "Failure")
+                        AddCount(failedAddresses, host);
+                    else if (direction == "In" && (result == "Success" || result == "Connect"))
+                        AddCount(succeeded, host);
                 }
             }
+            ShowAddresses(succeededList, succeededCaption, "Succeeded", succeeded);
+            ShowAddresses(failedList, failedCaption, "Failed", failedAddresses);
             rdpCount.Text = rdp.ToString("N0");
             sshCount.Text = ssh.ToString("N0");
             failureCount.Text = failed.ToString("N0");
@@ -818,7 +866,7 @@ namespace EventLog
                     return;
 
                 var sb = new StringBuilder();
-                sb.AppendLine("Time,Source,Direction,Result,Account,Address,Logon type,Event,Log,Details,Message");
+                sb.AppendLine("Time,Source,Direction,Result,Account,Address,Port,Action,Logon type,Event,Log,Details,Message");
                 foreach (DataRowView row in view)
                 {
                     sb.Append(Csv(row["Time"] is DateTime ? ((DateTime)row["Time"]).ToString("yyyy-MM-dd HH:mm:ss") : "")).Append(',');
@@ -827,6 +875,8 @@ namespace EventLog
                     sb.Append(Csv(Convert.ToString(row["Result"]))).Append(',');
                     sb.Append(Csv(Convert.ToString(row["User"]))).Append(',');
                     sb.Append(Csv(Convert.ToString(row["Address"]))).Append(',');
+                    sb.Append(Csv(Convert.ToString(row["Port"]))).Append(',');
+                    sb.Append(Csv(Convert.ToString(row["Action"]))).Append(',');
                     sb.Append(Csv(Convert.ToString(row["LogonType"]))).Append(',');
                     sb.Append(Csv(Convert.ToString(row["EventId"]))).Append(',');
                     sb.Append(Csv(Convert.ToString(row["Channel"]))).Append(',');
@@ -1008,6 +1058,99 @@ namespace EventLog
             {
                 return false;
             }
+        }
+
+        static void AddCount(Dictionary<string, int> counts, string host)
+        {
+            int count;
+            counts.TryGetValue(host, out count);
+            counts[host] = count + 1;
+        }
+
+        void ShowAddresses(ListView list, Label caption, string title, Dictionary<string, int> counts)
+        {
+            if (list == null || caption == null)
+                return;
+            caption.Text = title + "  " + counts.Count.ToString("N0");
+            var rows = new List<KeyValuePair<string, int>>(counts);
+            rows.Sort((a, b) =>
+            {
+                int byCount = b.Value.CompareTo(a.Value);
+                if (byCount != 0)
+                    return byCount;
+                return string.Compare(a.Key, b.Key, StringComparison.OrdinalIgnoreCase);
+            });
+
+            fillingAddresses = true;
+            list.BeginUpdate();
+            try
+            {
+                list.Items.Clear();
+                foreach (var row in rows)
+                {
+                    var item = new ListViewItem(row.Key);
+                    item.SubItems.Add(row.Value.ToString("N0"));
+                    list.Items.Add(item);
+                }
+            }
+            finally
+            {
+                list.EndUpdate();
+                fillingAddresses = false;
+            }
+        }
+
+        void AddressList_Selected(object sender, EventArgs e)
+        {
+            if (fillingAddresses)
+                return;
+            var list = sender as ListView;
+            if (list == null || list.SelectedItems.Count == 0)
+                return;
+            string ip = list.SelectedItems[0].Text;
+            if (!filterBox.Text.Equals(ip, StringComparison.OrdinalIgnoreCase))
+                filterBox.Text = ip;
+        }
+
+        ListView MakeAddressList()
+        {
+            var list = new ListView
+            {
+                Dock = DockStyle.Fill,
+                View = View.Details,
+                FullRowSelect = true,
+                BorderStyle = BorderStyle.None,
+                HeaderStyle = ColumnHeaderStyle.Nonclickable,
+                HideSelection = false,
+                MultiSelect = false
+            };
+            list.Columns.Add("Address", 220);
+            list.Columns.Add("Count", 72, HorizontalAlignment.Right);
+            list.Resize += (sender, args) =>
+            {
+                int addressWidth = list.ClientSize.Width - list.Columns[1].Width - SystemInformation.VerticalScrollBarWidth;
+                if (addressWidth < 80)
+                    addressWidth = 80;
+                list.Columns[0].Width = addressWidth;
+            };
+            list.SelectedIndexChanged += AddressList_Selected;
+            return list;
+        }
+
+        Panel AddressColumn(string title, Color color, ListView list, out Label caption)
+        {
+            var panel = new Panel { Dock = DockStyle.Fill, Padding = new Padding(4, 0, 4, 0) };
+            caption = new Label
+            {
+                Dock = DockStyle.Top,
+                Height = 22,
+                Font = boldFont,
+                ForeColor = color,
+                Text = title + "  0"
+            };
+            panel.Controls.Add(list);
+            panel.Controls.Add(caption);
+            return panel;
         }
 
         static string HostOnly(string address)

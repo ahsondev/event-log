@@ -10,6 +10,8 @@ namespace EventLog
         public string Result { get; set; }
         public string User { get; set; }
         public string Address { get; set; }
+        public string Port { get; set; }
+        public string Action { get; set; }
         public string LogonType { get; set; }
         public int EventId { get; set; }
         public long RecordId { get; set; }

@@ -58,6 +58,10 @@ namespace EventLog
             @"Disconnected from (?:user )?(?<user>\S+ )?(?<ip>\S+) port (?<port>\d+)",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
+        static readonly Regex EndpointInText = new Regex(
+            @"\b(?<ip>\d{1,3}(?:\.\d{1,3}){3})(?::(?<port>\d{1,5}))?\b",
+            RegexOptions.Compiled);
+
         static readonly Regex SshConnectionClosed = new Regex(
             @"Connection closed by (?:authenticating user )?(?<user>\S+ )?(?<ip>\S+) port (?<port>\d+)",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
@@ -138,6 +142,10 @@ namespace EventLog
                             AddNote(result, noteSet, "Remote Desktop session log was not found.");
                         else if (read.LogName == "Microsoft-Windows-TerminalServices-RDPClient/Operational")
                             AddNote(result, noteSet, "Outbound Remote Desktop log was not found.");
+                        else if (read.LogName == "Microsoft-Windows-RemoteDesktopServices-RdpCoreTS/Operational")
+                            AddNote(result, noteSet, "Remote Desktop client-address log was not found.");
+                        else if (read.LogName == "Microsoft-Windows-SMBServer/Security")
+                            AddNote(result, noteSet, "SMB sign-in log was not found, so file-share attempts cannot be named.");
                     }
                     else if (status == ChannelOpen.Failed)
                     {
@@ -172,6 +180,8 @@ namespace EventLog
             if (result.Events.Count == 0)
                 AddNote(result, noteSet, "No matching access events in this range.");
 
+            DropUnaddressedListenerEvents(result);
+            MergeSmbAttempts(result);
             result.Events.Sort((a, b) => b.Time.CompareTo(a.Time));
             return result;
         }
@@ -189,6 +199,14 @@ namespace EventLog
                     "Remote Desktop connections",
                     "RDP connection",
                     SystemIds(timeClause, 1149, 261),
+                    ChannelKind.RemoteDesktop,
+                    true,
+                    false));
+                reads.Add(new LogRead(
+                    "Microsoft-Windows-RemoteDesktopServices-RdpCoreTS/Operational",
+                    "Remote Desktop client addresses",
+                    "RDP connection",
+                    SystemIds(timeClause, 131),
                     ChannelKind.RemoteDesktop,
                     true,
                     false));
@@ -252,6 +270,19 @@ namespace EventLog
             {
                 reads.Add(Security("Network sign-ins", WithTypes(timeClause, new[] { 4624 }, 3, 8)));
                 reads.Add(Security("Network failures", WithTypes(timeClause, new[] { 4625 }, 3, 8)));
+                reads.Add(Security("File share access", SystemIds(timeClause, 5140, 5145)));
+            }
+
+            if (query.Network || query.Failures)
+            {
+                reads.Add(new LogRead(
+                    "Microsoft-Windows-SMBServer/Security",
+                    "SMB sign-ins",
+                    "SMB",
+                    SystemIds(timeClause, 551),
+                    ChannelKind.Smb,
+                    true,
+                    false));
             }
 
             if (query.Failures)
@@ -584,6 +615,8 @@ namespace EventLog
                     return MapSshRecord(read, record, fields, formatted);
                 case ChannelKind.Gateway:
                     return MapGateway(read, record, fields, formatted);
+                case ChannelKind.Smb:
+                    return MapSmb(read, record, fields, formatted);
                 default:
                     return null;
             }
@@ -592,12 +625,17 @@ namespace EventLog
         static AccessEvent MapSecurity(LogRead read, EventRecord record, FieldBag fields, bool keepNoise)
         {
             int id = record.Id;
+            if (id == 5140 || id == 5145)
+                return MapShare(read, record, fields);
+
             string user = JoinUser(fields.Get("TargetDomainName", "Domain"), fields.Get("TargetUserName", "User"));
             string logonType = fields.Get("LogonType");
-            string process = fields.Get("ProcessName", "LogonProcessName");
-            string package = fields.Get("AuthenticationPackageName");
+            string processName = Useful(fields.Get("ProcessName"));
+            string logonProcess = Useful(fields.Get("LogonProcessName"));
+            string package = Useful(fields.Get("AuthenticationPackageName"));
             string workstation = fields.Get("WorkstationName", "ClientName");
-            string address = FormatAddress(fields.Get("IpAddress", "ClientAddress", "Address"), fields.Get("IpPort", "ClientPort"));
+            string address = FormatAddress(fields.Get("IpAddress", "ClientAddress", "Address"), "");
+            string port = CleanPort(fields.Get("IpPort", "ClientPort"));
 
             bool failure = id == 4625;
             if (!keepNoise && !failure && IsNoiseAccount(user))
@@ -606,9 +644,10 @@ namespace EventLog
             var ev = NewEvent(read, record);
             ev.User = user;
             ev.Address = address;
+            ev.Port = port;
             ev.LogonType = LogonTypeName(logonType);
 
-            bool ssh = ContainsSsh(process);
+            bool ssh = ContainsSsh(processName) || ContainsSsh(logonProcess);
             bool remoteLogon = logonType == "10" || logonType == "12";
             bool rdp = remoteLogon || id == 4778 || id == 4779;
             if (ssh) ev.Source = "SSH";
@@ -629,16 +668,20 @@ namespace EventLog
             else if (id == 4778) ev.Result = "Reconnect";
             else ev.Result = "Success";
 
-            string action = "Signed in";
-            if (ev.Result == "Failure") action = "Failed sign-in";
-            else if (ev.Result == "Logoff") action = "Signed out";
-            else if (ev.Result == "Disconnect") action = "Disconnected";
-            else if (ev.Result == "Reconnect") action = "Reconnected";
+            if (id == 4778) ev.Action = "Remote Desktop reconnect";
+            else if (id == 4779) ev.Action = "Remote Desktop disconnect";
+            else if (id == 4647) ev.Action = "Sign out";
+            else ev.Action = DescribeSecurityAction(ev.Source, logonType, logonProcess, package, processName);
 
-            if (ev.Source == "RDP") action += " via Remote Desktop";
-            else if (ev.Source == "SSH") action += " via SSH";
-            else if (ev.Source == "Network") action += " over the network";
-            else if (ev.Source == "Console") action += " at the console";
+            string lead = ev.Action;
+            if (ev.Result == "Failure")
+                lead = "Failed " + ev.Action;
+            else if (ev.Result == "Logoff")
+                lead = "Signed out";
+            else if (ev.Result == "Disconnect")
+                lead = ev.Action;
+            else if (ev.Result == "Reconnect")
+                lead = ev.Action;
 
             string why = failure ? ExplainFailure(fields.Get("Status"), fields.Get("SubStatus")) : "";
             string from = "";
@@ -646,12 +689,68 @@ namespace EventLog
                 from = "from " + address;
             else if (workstation.Length > 0 && workstation != "-" && !workstation.Equals("LOCAL", StringComparison.OrdinalIgnoreCase))
                 from = "workstation " + workstation;
+            if (ev.Port.Length > 0)
+                from = (from.Length > 0 ? from + " " : "") + "port " + ev.Port;
 
-            string auth = "";
-            if (!failure && ev.Result != "Logoff" && package.Length > 0 && package != "-")
-                auth = package;
+            ev.Summary = JoinParts(lead, why, from);
+            return ev;
+        }
 
-            ev.Summary = JoinParts(action, auth, why, from);
+        static AccessEvent MapShare(LogRead read, EventRecord record, FieldBag fields)
+        {
+            string share = Useful(fields.Get("ShareName"));
+            string relative = fields.Get("RelativeTargetName").Trim();
+            string action;
+            if (record.Id == 5145 && relative.Length > 0 && relative != "\\")
+                action = "Open " + share + (relative.StartsWith("\\", StringComparison.Ordinal) ? relative : "\\" + relative);
+            else if (share.Length > 0)
+                action = "Open share " + share;
+            else
+                action = "Open a network share";
+
+            var ev = NewEvent(read, record);
+            ev.Source = "Network";
+            ev.Direction = "In";
+            ev.Result = "Success";
+            ev.LogonType = "File share";
+            ev.Action = action;
+            ev.User = JoinUser(fields.Get("SubjectDomainName"), fields.Get("SubjectUserName", "SubjectUser"));
+            ev.Address = FormatAddress(fields.Get("IpAddress"), "");
+            ev.Port = CleanPort(fields.Get("IpPort"));
+            ev.Summary = JoinParts(action, ev.Address.Length > 0 ? "from " + ev.Address : "", ev.Port.Length > 0 ? "port " + ev.Port : "");
+            return ev;
+        }
+
+        static AccessEvent MapSmb(LogRead read, EventRecord record, FieldBag fields, string formatted)
+        {
+            string ip;
+            string port;
+            if (!TryDecodeSockaddr(fields.Get("ClientAddress"), out ip, out port))
+            {
+                string name = fields.Get("ClientName").Trim().TrimStart('\\');
+                SplitEndpoint(name, out ip, out port);
+            }
+            if (ip.Length == 0)
+                TryEndpoint(formatted, out ip, out port);
+
+            string spn = fields.Get("SPN");
+            string action = IsRealSpn(spn) ? "SMB sign-in to " + spn.Trim() : "SMB sign-in";
+            var ev = NewEvent(read, record);
+            ev.Source = "Network";
+            ev.Direction = "In";
+            ev.Result = "Failure";
+            ev.LogonType = "SMB";
+            ev.Action = action;
+            ev.User = Useful(fields.Get("UserName"));
+            ev.Address = FormatAddress(ip, "");
+            ev.Port = CleanPort(port);
+            string why = ExplainFailure(fields.Get("Status"), "");
+            ev.Summary = JoinParts(
+                "Failed " + action,
+                why,
+                ev.Address.Length > 0 ? "from " + ev.Address : "",
+                ev.Port.Length > 0 ? "port " + ev.Port : "");
+            ev.Message = BuildMessage(record, formatted, fields);
             return ev;
         }
 
@@ -661,7 +760,9 @@ namespace EventLog
             string domain = fields.Get("Domain");
             string session = fields.Get("SessionID", "SessionId", "Session");
             string user = fields.Get("User", "Param1");
-            string address = fields.Get("Address", "SourceNetworkAddress", "Param3");
+            string address;
+            string port;
+            ReadClientEndpoint(fields, formatted, out address, out port);
 
             if (id == 1149)
             {
@@ -680,7 +781,8 @@ namespace EventLog
             ev.Source = "RDP";
             ev.LogonType = "Remote Desktop";
             ev.User = JoinUser(domain, user);
-            ev.Address = FormatAddress(address, "");
+            ev.Address = address;
+            ev.Port = port;
             ev.Message = BuildMessage(record, formatted, fields);
 
             switch (id)
@@ -692,6 +794,13 @@ namespace EventLog
                 case 261:
                     ev.Result = "Connect";
                     ev.Summary = "Incoming connection";
+                    break;
+                case 131:
+                    ev.Result = "Connect";
+                    string transport = fields.Get("ConnType");
+                    ev.Summary = transport.Length > 0
+                        ? "Incoming " + transport + " connection"
+                        : "Incoming connection";
                     break;
                 case 21:
                     ev.Result = "Success";
@@ -722,13 +831,16 @@ namespace EventLog
                     break;
             }
 
+            ev.Action = ev.Summary;
             if (session.Length > 0 && id != 1149)
                 ev.Summary = ev.Summary + " | session " + session;
             if (ev.Address.Length > 0
                 && !ev.Address.Equals("local", StringComparison.OrdinalIgnoreCase)
                 && ev.Summary.IndexOf(ev.Address, StringComparison.OrdinalIgnoreCase) < 0)
                 ev.Summary = ev.Summary + " | from " + ev.Address;
-            ev.Direction = (id == 1149 || id == 261 || IsRemoteAddress(ev.Address)) ? "In" : "Local";
+            if (ev.Port.Length > 0 && ev.Summary.IndexOf("port " + ev.Port, StringComparison.OrdinalIgnoreCase) < 0)
+                ev.Summary = ev.Summary + " | port " + ev.Port;
+            ev.Direction = (id == 1149 || id == 261 || id == 131 || IsRemoteAddress(ev.Address)) ? "In" : "Local";
             return ev;
         }
 
@@ -741,6 +853,7 @@ namespace EventLog
             ev.Direction = "Out";
             ev.LogonType = "Outbound";
             ev.Address = FormatAddress(target, "");
+            ev.Action = "Outbound Remote Desktop";
             ev.Message = BuildMessage(record, formatted, fields);
 
             switch (id)
@@ -799,6 +912,7 @@ namespace EventLog
             var ev = NewEvent(read, record);
             ev.Source = "RDP";
             ev.Direction = "In";
+            ev.Action = "Remote Desktop gateway";
             ev.LogonType = "RD Gateway";
             ev.User = JoinUser(fields.Get("Domain"), fields.Get("User", "Param1"));
             ev.Address = FormatAddress(fields.Get("IpAddress", "Address", "Param2", "Param3"), "");
@@ -825,6 +939,8 @@ namespace EventLog
                 Message = (message ?? "").Trim(),
                 User = "",
                 Address = "",
+                Port = "",
+                Action = "",
                 LogonType = "",
                 Result = "",
                 Summary = ""
@@ -841,6 +957,7 @@ namespace EventLog
             if (accepted.Success)
             {
                 FillSsh(ev, accepted, "Success");
+                ev.Action = "SSH sign-in";
                 ev.Summary = "Accepted " + ev.LogonType;
                 return;
             }
@@ -849,6 +966,7 @@ namespace EventLog
             if (failed.Success)
             {
                 FillSsh(ev, failed, "Failure");
+                ev.Action = "SSH sign-in";
                 bool invalid = message.IndexOf("invalid user", StringComparison.OrdinalIgnoreCase) >= 0;
                 ev.Summary = invalid ? "Invalid user" : "Failed " + ev.LogonType;
                 return;
@@ -858,6 +976,7 @@ namespace EventLog
             if (invalidUser.Success)
             {
                 FillSsh(ev, invalidUser, "Failure");
+                ev.Action = "SSH sign-in";
                 ev.LogonType = "SSH";
                 ev.Summary = "Invalid user";
                 return;
@@ -867,6 +986,7 @@ namespace EventLog
             if (connect.Success)
             {
                 FillSsh(ev, connect, "Connect");
+                ev.Action = "SSH connection";
                 ev.LogonType = "SSH";
                 ev.Summary = "Connection opened";
                 return;
@@ -878,6 +998,7 @@ namespace EventLog
             if (closed.Success)
             {
                 FillSsh(ev, closed, "Disconnect");
+                ev.Action = "SSH disconnect";
                 ev.LogonType = "SSH";
                 ev.Summary = "Disconnected";
             }
@@ -895,7 +1016,10 @@ namespace EventLog
             var ip = match.Groups["ip"];
             var port = match.Groups["port"];
             if (ip.Success)
-                ev.Address = FormatAddress(ip.Value, port.Success ? port.Value : "");
+            {
+                ev.Address = FormatAddress(ip.Value, "");
+                ev.Port = CleanPort(port.Success ? port.Value : "");
+            }
         }
 
         static void ApplyLooseClass(AccessEvent ev, string message)
@@ -941,6 +1065,8 @@ namespace EventLog
                 LogonType = "",
                 Source = "",
                 Direction = "",
+                Port = "",
+                Action = "",
                 Result = "",
                 Summary = "",
                 Message = ""
@@ -1213,6 +1339,397 @@ namespace EventLog
             return domain + "\\" + user;
         }
 
+        static void DropUnaddressedListenerEvents(AccessLogResult result)
+        {
+            var addressed = new List<DateTime>();
+            foreach (var ev in result.Events)
+            {
+                if (ev.EventId == 131 && IsRemoteAddress(ev.Address))
+                    addressed.Add(ev.Time);
+            }
+            if (addressed.Count == 0)
+                return;
+
+            result.Events.RemoveAll(ev =>
+            {
+                if (ev.EventId != 261 || IsRemoteAddress(ev.Address))
+                    return false;
+                foreach (var time in addressed)
+                {
+                    double seconds = ev.Time.Subtract(time).TotalSeconds;
+                    if (seconds < 0)
+                        seconds = -seconds;
+                    if (seconds <= 3)
+                        return true;
+                }
+                return false;
+            });
+        }
+
+        static void ReadClientEndpoint(FieldBag fields, string formatted, out string address, out string port)
+        {
+            string raw = fields.Get(
+                "Address",
+                "SourceNetworkAddress",
+                "Param3",
+                "ClientIP",
+                "IpAddress",
+                "IPAddress",
+                "IPString",
+                "ClientAddress");
+            string ip;
+            string parsedPort;
+            SplitEndpoint(raw, out ip, out parsedPort);
+            port = CleanPort(parsedPort);
+            if (port.Length == 0)
+                port = CleanPort(fields.Get("IpPort", "ClientPort", "Port"));
+            if (ip.Length == 0)
+            {
+                string foundIp;
+                string foundPort;
+                if (TryEndpoint(formatted, out foundIp, out foundPort) || TryEndpoint(FieldDump(fields), out foundIp, out foundPort))
+                {
+                    ip = foundIp;
+                    if (port.Length == 0)
+                        port = CleanPort(foundPort);
+                }
+            }
+            address = FormatAddress(ip, "");
+        }
+
+        static void MergeSmbAttempts(AccessLogResult result)
+        {
+            var smb = new List<AccessEvent>();
+            var logons = new List<AccessEvent>();
+            foreach (var ev in result.Events)
+            {
+                if (ev.EventId == 551)
+                    smb.Add(ev);
+                else if (ev.EventId == 4624 || ev.EventId == 4625)
+                    logons.Add(ev);
+            }
+            if (smb.Count == 0)
+                return;
+
+            var consumed = new HashSet<AccessEvent>();
+            var used = new HashSet<AccessEvent>();
+            foreach (var share in smb)
+            {
+                AccessEvent best = null;
+                double bestDelta = 5;
+                foreach (var logon in logons)
+                {
+                    if (used.Contains(logon))
+                        continue;
+                    if (!SameHost(share.Address, logon.Address))
+                        continue;
+                    if (!UsersCompatible(share.User, logon.User))
+                        continue;
+                    double seconds = share.Time.Subtract(logon.Time).TotalSeconds;
+                    if (seconds < 0)
+                        seconds = -seconds;
+                    if (seconds < bestDelta)
+                    {
+                        bestDelta = seconds;
+                        best = logon;
+                    }
+                }
+                if (best == null)
+                    continue;
+
+                used.Add(best);
+                consumed.Add(share);
+                if (best.Port.Length == 0 && share.Port.Length > 0)
+                {
+                    best.Port = share.Port;
+                    if (best.Summary.IndexOf("port " + share.Port, StringComparison.OrdinalIgnoreCase) < 0)
+                        best.Summary = JoinParts(best.Summary, "port " + share.Port);
+                }
+                if (share.Action.IndexOf(" to ", StringComparison.OrdinalIgnoreCase) >= 0)
+                    best.Action = share.Action;
+                else if (best.Action.IndexOf("network sign-in", StringComparison.OrdinalIgnoreCase) >= 0)
+                    best.Action = best.Action.Replace("network sign-in", "SMB sign-in");
+                else if (best.Action.IndexOf("SMB", StringComparison.OrdinalIgnoreCase) < 0)
+                    best.Action = share.Action;
+
+                best.Summary = best.Summary
+                    .Replace("NTLM network sign-in", "NTLM SMB sign-in")
+                    .Replace("Kerberos network sign-in", "Kerberos SMB sign-in")
+                    .Replace("Negotiate network sign-in", "Negotiate SMB sign-in")
+                    .Replace("Cleartext network sign-in", "Cleartext SMB sign-in");
+                if (best.Summary.IndexOf("SMB", StringComparison.OrdinalIgnoreCase) < 0)
+                    best.Summary = "SMB | " + best.Summary;
+            }
+
+            if (consumed.Count > 0)
+                result.Events.RemoveAll(ev => consumed.Contains(ev));
+        }
+
+        static bool SameHost(string left, string right)
+        {
+            left = HostOf(left);
+            right = HostOf(right);
+            return left.Length > 0
+                && !left.Equals("local", StringComparison.OrdinalIgnoreCase)
+                && left.Equals(right, StringComparison.OrdinalIgnoreCase);
+        }
+
+        static string HostOf(string address)
+        {
+            if (string.IsNullOrWhiteSpace(address))
+                return "";
+            address = address.Trim();
+            if (address.StartsWith("[", StringComparison.Ordinal))
+            {
+                int end = address.IndexOf(']');
+                if (end > 1)
+                    return address.Substring(1, end - 1);
+            }
+            int colon = address.IndexOf(':');
+            if (colon > 0 && colon == address.LastIndexOf(':'))
+                return address.Substring(0, colon);
+            return address;
+        }
+
+        static bool UsersCompatible(string left, string right)
+        {
+            left = AccountName(left);
+            right = AccountName(right);
+            if (left.Length == 0 || right.Length == 0)
+                return true;
+            return left.Equals(right, StringComparison.OrdinalIgnoreCase);
+        }
+
+        static string AccountName(string user)
+        {
+            user = Useful(user);
+            int slash = user.LastIndexOf('\\');
+            if (slash >= 0 && slash < user.Length - 1)
+                user = user.Substring(slash + 1);
+            return user;
+        }
+
+        static string DescribeSecurityAction(string source, string logonType, string logonProcess, string package, string processName)
+        {
+            string service = ServiceFromProcess(processName);
+            if (service.Length > 0)
+                return service;
+            if (source == "RDP")
+                return "Remote Desktop sign-in";
+            if (source == "SSH")
+                return "SSH sign-in";
+            if (source == "Console")
+                return logonType == "9" ? "Run as another user" : "Console sign-in";
+            if (logonType == "4" || logonType == "5")
+                return "Service sign-in";
+
+            string method = AuthMethod(logonProcess, package);
+            if (source == "Network" || logonType == "3" || logonType == "8")
+            {
+                if (logonType == "8")
+                    return method.Length > 0 ? method + " cleartext network sign-in" : "Cleartext network sign-in";
+                return method.Length > 0 ? method + " network sign-in" : "Network sign-in";
+            }
+            if (method.Length > 0)
+                return method + " sign-in";
+            return "Sign-in";
+        }
+
+        static string AuthMethod(string logonProcess, string package)
+        {
+            string blob = (logonProcess ?? "") + " " + (package ?? "");
+            if (blob.IndexOf("NTLM", StringComparison.OrdinalIgnoreCase) >= 0
+                || blob.IndexOf("NtLm", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "NTLM";
+            if (blob.IndexOf("Kerberos", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "Kerberos";
+            if (blob.IndexOf("Negotiate", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "Negotiate";
+            return "";
+        }
+
+        static string ServiceFromProcess(string processName)
+        {
+            if (string.IsNullOrWhiteSpace(processName))
+                return "";
+            string file = Path.GetFileName(processName.Trim());
+            if (file.Length == 0 || file == "-" || IsGenericProcess(file))
+                return "";
+            if (file.Equals("sqlservr.exe", StringComparison.OrdinalIgnoreCase))
+                return "SQL Server sign-in";
+            if (file.Equals("w3wp.exe", StringComparison.OrdinalIgnoreCase) || file.Equals("iisexpress.exe", StringComparison.OrdinalIgnoreCase))
+                return "IIS sign-in";
+            if (file.Equals("mysqld.exe", StringComparison.OrdinalIgnoreCase) || file.Equals("mysqld-nt.exe", StringComparison.OrdinalIgnoreCase))
+                return "MySQL sign-in";
+            if (file.Equals("postgres.exe", StringComparison.OrdinalIgnoreCase))
+                return "PostgreSQL sign-in";
+            if (file.IndexOf("tomcat", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "Tomcat sign-in";
+            if (file.Equals("java.exe", StringComparison.OrdinalIgnoreCase) || file.Equals("javaw.exe", StringComparison.OrdinalIgnoreCase))
+                return "Java sign-in";
+            if (file.IndexOf("sshd", StringComparison.OrdinalIgnoreCase) >= 0 || file.IndexOf("OpenSSH", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "SSH sign-in";
+            return "Sign-in via " + file;
+        }
+
+        static bool IsGenericProcess(string file)
+        {
+            return file.Equals("lsass.exe", StringComparison.OrdinalIgnoreCase)
+                || file.Equals("svchost.exe", StringComparison.OrdinalIgnoreCase)
+                || file.Equals("winlogon.exe", StringComparison.OrdinalIgnoreCase)
+                || file.Equals("services.exe", StringComparison.OrdinalIgnoreCase)
+                || file.Equals("csrss.exe", StringComparison.OrdinalIgnoreCase)
+                || file.Equals("dwm.exe", StringComparison.OrdinalIgnoreCase)
+                || file.Equals("sihost.exe", StringComparison.OrdinalIgnoreCase)
+                || file.Equals("userinit.exe", StringComparison.OrdinalIgnoreCase)
+                || file.Equals("logonui.exe", StringComparison.OrdinalIgnoreCase);
+        }
+
+        static string Useful(string value)
+        {
+            value = (value ?? "").Trim();
+            if (value.Length == 0 || value == "-")
+                return "";
+            return value;
+        }
+
+        static bool IsRealSpn(string spn)
+        {
+            if (string.IsNullOrWhiteSpace(spn))
+                return false;
+            if (spn.IndexOf("failed", StringComparison.OrdinalIgnoreCase) >= 0)
+                return false;
+            return spn.IndexOf('/') >= 0;
+        }
+
+        static bool TryDecodeSockaddr(string raw, out string ip, out string port)
+        {
+            ip = "";
+            port = "";
+            if (string.IsNullOrWhiteSpace(raw))
+                return false;
+            raw = raw.Trim();
+            if (raw.IndexOf('.') >= 0)
+            {
+                SplitEndpoint(raw, out ip, out port);
+                return ip.Length > 0;
+            }
+
+            var hex = new StringBuilder();
+            foreach (char ch in raw)
+            {
+                if ((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F'))
+                    hex.Append(ch);
+            }
+            if (hex.Length < 16 || hex.Length % 2 != 0)
+                return false;
+
+            int length = hex.Length / 2;
+            var data = new byte[length];
+            for (int i = 0; i < length; i++)
+                data[i] = byte.Parse(hex.ToString(i * 2, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture);
+            if (data.Length < 8)
+                return false;
+
+            int family = data[0] | (data[1] << 8);
+            int portNumber = (data[2] << 8) | data[3];
+            if (portNumber > 0 && portNumber <= 65535)
+                port = portNumber.ToString(CultureInfo.InvariantCulture);
+
+            if (family == 2 && data.Length >= 8)
+            {
+                ip = data[4].ToString(CultureInfo.InvariantCulture) + "."
+                    + data[5].ToString(CultureInfo.InvariantCulture) + "."
+                    + data[6].ToString(CultureInfo.InvariantCulture) + "."
+                    + data[7].ToString(CultureInfo.InvariantCulture);
+                return true;
+            }
+
+            if (family == 23 && data.Length >= 24)
+            {
+                var addr = new byte[16];
+                Buffer.BlockCopy(data, 8, addr, 0, 16);
+                ip = new IPAddress(addr).ToString();
+                return ip.Length > 0;
+            }
+            return false;
+        }
+
+        static bool TryEndpoint(string text, out string ip, out string port)
+        {
+            ip = "";
+            port = "";
+            if (string.IsNullOrEmpty(text))
+                return false;
+            Match withPort = null;
+            foreach (Match match in EndpointInText.Matches(text))
+            {
+                if (match.Groups["port"].Success)
+                {
+                    withPort = match;
+                    break;
+                }
+                if (ip.Length == 0)
+                {
+                    ip = match.Groups["ip"].Value;
+                }
+            }
+            if (withPort != null)
+            {
+                ip = withPort.Groups["ip"].Value;
+                port = withPort.Groups["port"].Value;
+                return true;
+            }
+            return ip.Length > 0;
+        }
+
+        static string CleanPort(string port)
+        {
+            port = (port ?? "").Trim();
+            int number;
+            if (!int.TryParse(port, NumberStyles.Integer, CultureInfo.InvariantCulture, out number))
+                return "";
+            if (number <= 0 || number > 65535)
+                return "";
+            return number.ToString(CultureInfo.InvariantCulture);
+        }
+
+        static void SplitEndpoint(string raw, out string ip, out string port)
+        {
+            ip = "";
+            port = "";
+            raw = (raw ?? "").Trim();
+            if (raw.Length == 0 || raw == "-")
+                return;
+
+            if (raw[0] == '[')
+            {
+                int end = raw.IndexOf(']');
+                if (end > 1)
+                {
+                    ip = raw.Substring(1, end - 1);
+                    if (end + 2 < raw.Length && raw[end + 1] == ':')
+                        port = raw.Substring(end + 2);
+                    return;
+                }
+            }
+
+            int colon = raw.IndexOf(':');
+            if (colon > 0 && colon == raw.LastIndexOf(':'))
+            {
+                string tail = raw.Substring(colon + 1);
+                int portNumber;
+                if (int.TryParse(tail, NumberStyles.Integer, CultureInfo.InvariantCulture, out portNumber))
+                {
+                    ip = raw.Substring(0, colon);
+                    port = tail;
+                    return;
+                }
+            }
+
+            ip = raw;
+        }
+
         static bool IsRemoteAddress(string address)
         {
             return !string.IsNullOrEmpty(address)
@@ -1447,7 +1964,8 @@ namespace EventLog
             RemoteDesktop,
             RdpClient,
             SshLog,
-            Gateway
+            Gateway,
+            Smb
         }
 
         enum ChannelOpen
