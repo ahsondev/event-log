@@ -5,11 +5,11 @@ using System.Runtime.InteropServices;
 // General Information about an assembly is controlled through the following
 // set of attributes. Change these attribute values to modify the information
 // associated with an assembly.
-[assembly: AssemblyTitle("EventLog")]
-[assembly: AssemblyDescription("")]
+[assembly: AssemblyTitle("Server Access Log")]
+[assembly: AssemblyDescription("Reviews Remote Desktop, SSH, and Windows logon events.")]
 [assembly: AssemblyConfiguration("")]
 [assembly: AssemblyCompany("")]
-[assembly: AssemblyProduct("EventLog")]
+[assembly: AssemblyProduct("Server Access Log")]
 [assembly: AssemblyCopyright("Copyright ©  2026")]
 [assembly: AssemblyTrademark("")]
 [assembly: AssemblyCulture("")]
